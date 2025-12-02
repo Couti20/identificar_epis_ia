@@ -1,106 +1,205 @@
 import cv2
+import threading
+import time
 from ultralytics import YOLO
 
-# --- CONFIGURAÇÃO INICIAL ---
-print("Carregando modelo... Aguarde um momento.")
-model = YOLO("best.pt")
+class DetectorEPILocal:
+    """
+    Detector de EPIs usando YOLOv11 Local + Threading.
+    O Threading garante que o vídeo não trave enquanto a IA pensa.
+    """
 
-# Dicionário para limpar os nomes (Traduz e simplifica)
-nomes_bonitos = {
-    # Capacetes
-    'Helmet': 'Capacete', 'helmet': 'Capacete',
-    '1-2-helmet': 'Capacete', '3-4-helmet': 'Capacete',
-    'Full-face-helmet': 'Capacete',
+    # --- CONFIGURAÇÕES DE CLASSES E CORES ---
+    DANGER_CLASSES = {
+        'no-helmet', 'no-glove', 'no-vest', 'no-goggles', 
+        'no-earplug', 'no-hairnet', 'no-mask', 'no-boots',
+        'sem-capacete', 'sem-luvas', 'sem-colete', 'sem-oculos',
+        'sem-protetor', 'sem-touca'
+    }
     
-    # Ausências (Perigo)
-    'no-helmet': 'SEM CAPACETE!',
-    'no-goggles': 'SEM OCULOS!',
-    'no-vest': 'SEM COLETE!',
-    'no-glove': 'SEM LUVAS!',
-    'no_earplug': 'SEM PROTETOR!', # Ajustei conforme seu print
-    'no_hairnet': 'SEM TOUCA!',    # Ajustei conforme seu print
-    
-    # EPIs
-    'goggles': 'Oculos',
-    'vest': 'Colete',
-    'boots': 'Botas',
-    'glove': 'Luvas',
-    'earplug': 'Protetor Auricular',
-    
-    # Outros
-    'cables': 'Fios Soltos',
-    'person': 'Pessoa'
-}
+    SAFETY_CLASSES = {
+        'helmet', 'glove', 'vest', 'goggles', 
+        'earplug', 'hairnet', 'mask', 'boots',
+        'capacete', 'luvas', 'colete', 'oculos'
+    }
 
-# Cores (B, G, R)
-cor_verde = (0, 255, 0)      # Seguro
-cor_vermelha = (0, 0, 255)   # Perigo
-cor_neutra = (255, 0, 0)     # Neutro
+    COLOR_RED = (0, 0, 255)
+    COLOR_GREEN = (0, 255, 0)
+    COLOR_YELLOW = (0, 255, 255) # Para coisas neutras (Pessoa, Fios)
 
-# --- CONFIGURAÇÃO DA CÂMERA E TELA ---
-cap = cv2.VideoCapture(0)
+    # Tradutor de nomes bagunçados para nomes bonitos
+    EPI_ALIASES = {
+        # Capacetes
+        'Helmet': 'Capacete', 'helmet': 'Capacete', '1-2-helmet': 'Capacete',
+        '3-4-helmet': 'Capacete', 'Full-face-helmet': 'Capacete',
+        
+        # Ausências (Perigo)
+        'no-helmet': 'SEM CAPACETE', 'no_helmet': 'SEM CAPACETE',
+        'no-goggles': 'SEM OCULOS', 'no_goggles': 'SEM OCULOS',
+        'no-vest': 'SEM COLETE', 'no_vest': 'SEM COLETE',
+        'no-glove': 'SEM LUVAS', 'no_glove': 'SEM LUVAS',
+        'no-earplug': 'SEM PROTETOR', 'no_earplug': 'SEM PROTETOR',
+        'no-hairnet': 'SEM TOUCA', 'no_hairnet': 'SEM TOUCA',
+        
+        # EPIs
+        'goggles': 'Oculos',
+        'vest': 'Colete',
+        'glove': 'Luvas',
+        'earplug': 'Protetor Auricular',
+        'hairnet': 'Touca',
+        'boots': 'Botas',
+        
+        # Outros
+        'person': 'Pessoa',
+        'cables': 'Fios/Cabos'
+    }
 
-# Define a resolução de CAPTURA (Padrão 640x480 é mais rápido para processar)
-cap.set(3, 640)
-cap.set(4, 480)
+    def __init__(self, model_path="best.pt", conf=0.25):
+        print(f"[INIT] Carregando modelo YOLO local: {model_path}...")
+        try:
+            self.model = YOLO(model_path)
+            print("[INIT] Modelo carregado com sucesso!")
+        except Exception as e:
+            print(f"[ERRO] Não foi possível carregar o modelo. Verifique se o arquivo existe.\nErro: {e}")
+            exit()
 
-# Cria uma janela que permite redimensionar
-nome_janela = "Detector de EPIs (YOLOv11)"
-cv2.namedWindow(nome_janela, cv2.WINDOW_NORMAL)
+        self.conf = conf
+        self.running = False
+        
+        # Variáveis compartilhadas entre as Threads
+        self.frame_atual = None          # O frame que a câmera acabou de pegar
+        self.deteccoes_atuais = []       # As últimas caixas que a IA achou
+        self.lock = threading.Lock()     # Segurança para as threads não brigarem
 
-# Força a janela a abrir GRANDE (1280x720) na sua tela
-cv2.resizeWindow(nome_janela, 1280, 720)
+    def obter_cor_e_nome(self, nome_raw):
+        """Define a cor e traduz o nome baseado na classe"""
+        nome_raw_limpo = nome_raw.lower().strip()
+        nome_bonito = self.EPI_ALIASES.get(nome_raw, nome_raw) # Tenta traduzir, senão usa o original
 
-print("✅ Câmera iniciada! A janela deve abrir grande agora.")
-print("Pressione 'Q' para sair.")
+        # Lógica de cores
+        if nome_raw_limpo in self.DANGER_CLASSES or "sem" in nome_bonito.lower() or "no_" in nome_raw_limpo:
+            return self.COLOR_RED, nome_bonito
+        elif nome_raw_limpo in self.SAFETY_CLASSES:
+            return self.COLOR_GREEN, nome_bonito
+        else:
+            return self.COLOR_YELLOW, nome_bonito
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Erro ao ler a câmera.")
-        break
+    def cerebro_ia(self):
+        """
+        Esta função roda em SEGUNDO PLANO (outra thread).
+        Ela pega o frame atual, passa no YOLO e atualiza as detecções.
+        """
+        while self.running:
+            if self.frame_atual is not None:
+                # Copia o frame para não travar a câmera
+                img_para_ia = self.frame_atual.copy()
 
-    # --- O PULO DO GATO (AJUSTE FINO) ---
-    # conf=0.45: Só mostra se tiver 45% de certeza (Elimina quadrados gigantes na parede)
-    # iou=0.5: Evita desenhar dois quadrados para o mesmo objeto
-    # imgsz=320: Mantém a velocidade alta no seu notebook
-    results = model(frame, stream=True, conf=0.45, iou=0.5, imgsz=320, verbose=False)
+                # --- INFERÊNCIA YOLO ---
+                # imgsz=320: Mantém rápido para CPU
+                # conf=self.conf: Sua régua de qualidade
+                # iou=0.6: Evita caixas duplicadas
+                results = self.model(img_para_ia, verbose=False, imgsz=320, conf=self.conf, iou=0.6)
 
-    for r in results:
-        boxes = r.boxes
-        for box in boxes:
-            # 1. Coordenadas
-            x1, y1, x2, y2 = box.xyxy[0]
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                novas_deteccoes = []
+                
+                # Processa os resultados
+                for r in results:
+                    boxes = r.boxes
+                    for box in boxes:
+                        # Extrai dados
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        conf = float(box.conf[0])
+                        cls_id = int(box.cls[0])
+                        nome_raw = self.model.names[cls_id]
 
-            # 2. Identificação
-            cls_id = int(box.cls[0])
-            current_name = model.names[cls_id]
-            label = nomes_bonitos.get(current_name, current_name)
+                        # --- FILTROS EXTRAS (OPCIONAL) ---
+                        # Aqui você pode ignorar o "Sem Oculos" se a confiança for baixa
+                        nome_bonito = self.EPI_ALIASES.get(nome_raw, nome_raw)
+                        if "SEM OCULOS" in nome_bonito and conf < 0.50:
+                            continue # Ignora falsos positivos de óculos
 
-            # 3. Definição de Cores
-            if "SEM" in label:
-                color = cor_vermelha
-            elif label in ['Pessoa', 'Fios Soltos', 'Botas']:
-                color = cor_neutra
-            else:
-                color = cor_verde
+                        novas_deteccoes.append({
+                            'coords': (x1, y1, x2, y2),
+                            'conf': conf,
+                            'nome_raw': nome_raw
+                        })
 
-            # 4. Desenho (Retângulo mais grosso para ver melhor na tela grande)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                # Atualiza a lista oficial de detecções
+                with self.lock:
+                    self.deteccoes_atuais = novas_deteccoes
             
-            # Etiqueta
-            # Calcula o tamanho do texto para fazer o fundo colorido certinho
-            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-            cv2.rectangle(frame, (x1, y1 - 30), (x1 + w, y1), color, -1)
-            cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            # Pequena pausa para não fritar o processador (opcional)
+            time.sleep(0.01)
 
-    # Mostra a imagem na janela (que já definimos como grande)
-    cv2.imshow(nome_janela, frame)
+    def iniciar(self):
+        """Inicia a câmera e o loop visual"""
+        cap = cv2.VideoCapture(0)
+        
+        # Tenta resolução HD
+        cap.set(3, 1280)
+        cap.set(4, 720)
 
-    # Sai com 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        if not cap.isOpened():
+            print("[ERRO] Câmera não encontrada.")
+            return
 
-cap.release()
-cv2.destroyAllWindows()
+        self.running = True
+        
+        # Inicia a Thread da IA (Cérebro separado)
+        thread_ia = threading.Thread(target=self.cerebro_ia)
+        thread_ia.daemon = True
+        thread_ia.start()
+
+        print("[INFO] Sistema rodando! Pressione 'Q' para sair.")
+        print("[INFO] Thread de vídeo: 30 FPS | Thread de IA: Rodando em paralelo.")
+
+        # Janela maximizada
+        cv2.namedWindow("Detector Profissional Local", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Detector Profissional Local", 1280, 720)
+
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+
+            # Atualiza o frame para a IA ler
+            self.frame_atual = frame
+
+            # --- DESENHO ---
+            # Pega as últimas detecções disponíveis (com segurança de Thread)
+            with self.lock:
+                deteccoes_para_desenhar = list(self.deteccoes_atuais)
+
+            for det in deteccoes_para_desenhar:
+                x1, y1, x2, y2 = det['coords']
+                conf = det['conf']
+                nome_raw = det['nome_raw']
+
+                cor, texto = self.obter_cor_e_nome(nome_raw)
+                
+                # Desenha Retângulo
+                cv2.rectangle(frame, (x1, y1), (x2, y2), cor, 2)
+                
+                # Desenha Texto com Fundo
+                label = f"{texto} {int(conf*100)}%"
+                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, y1 - 25), (x1 + w, y1), cor, -1)
+                cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Informações na tela
+            fps_ia = "IA: Rodando..." 
+            cv2.putText(frame, "Modo: YOLOv11 Local (GPU/CPU)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+
+            cv2.imshow("Detector Profissional Local", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        self.running = False
+        cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    # Inicia o detector usando o best.pt da mesma pasta
+    # conf=0.25: Ajuste a sensibilidade aqui
+    app = DetectorEPILocal(model_path="best.pt", conf=0.25)
+    app.iniciar()
