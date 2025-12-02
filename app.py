@@ -1,195 +1,260 @@
 import cv2
 import threading
 import time
+import math
+import numpy as np
 from ultralytics import YOLO
 
-class DetectorEPILocal:
+class DetectorEPIEstavel:
     """
-    Detector de EPIs usando YOLOv11 Local + Threading.
-    O Threading garante que o vídeo não trave enquanto a IA pensa.
+    Versão Estável e TELA CHEIA:
+    - Força a imagem a esticar para 1920x1080 (Full HD).
+    - Janela abre em modo Fullscreen (sem bordas).
     """
 
-    # --- CONFIGURAÇÕES DE CLASSES E CORES ---
-    DANGER_CLASSES = {
-        'no-helmet', 'no-glove', 'no-vest', 'no-goggles', 
-        'no-earplug', 'no-hairnet', 'no-mask', 'no-boots',
-        'sem-capacete', 'sem-luvas', 'sem-colete', 'sem-oculos',
-        'sem-protetor', 'sem-touca'
-    }
-    
-    SAFETY_CLASSES = {
-        'helmet', 'glove', 'vest', 'goggles', 
-        'earplug', 'hairnet', 'mask', 'boots',
-        'capacete', 'luvas', 'colete', 'oculos'
-    }
+    # --- CONFIGURAÇÕES VISUAIS ---
+    COR_PERIGO = (0, 0, 255)    # Vermelho
+    COR_SEGURO = (0, 255, 0)    # Verde
+    COR_NEUTRO = (255, 200, 0)  # Azul Claro
 
-    COLOR_RED = (0, 0, 255)
-    COLOR_GREEN = (0, 255, 0)
-    COLOR_YELLOW = (0, 255, 255) # Para coisas neutras (Pessoa, Fios)
+    # --- CONFIGURAÇÃO DE PERSISTÊNCIA ---
+    TEMPO_MEMORIA = 0.8 
+    DISTANCIA_MAX_MATCH = 150
 
-    # Tradutor de nomes bagunçados para nomes bonitos
-    EPI_ALIASES = {
-        # Capacetes
-        'Helmet': 'Capacete', 'helmet': 'Capacete', '1-2-helmet': 'Capacete',
-        '3-4-helmet': 'Capacete', 'Full-face-helmet': 'Capacete',
+    MAPA_CLASSES = {
+        # --- PERIGO ---
+        'no-helmet': ('SEM CAPACETE', 1), 'no_helmet': ('SEM CAPACETE', 1),
+        'no-goggles': ('SEM OCULOS', 1), 'no_goggles': ('SEM OCULOS', 1),
+        'no-vest': ('SEM COLETE', 1), 'no_vest': ('SEM COLETE', 1),
+        'no-glove': ('SEM LUVAS', 1), 'no_glove': ('SEM LUVAS', 1),
+        'no-earplug': ('SEM PROTETOR', 1), 'no_earplug': ('SEM PROTETOR', 1),
+        'no-hairnet': ('SEM TOUCA', 1), 'no_hairnet': ('SEM TOUCA', 1),
         
-        # Ausências (Perigo)
-        'no-helmet': 'SEM CAPACETE', 'no_helmet': 'SEM CAPACETE',
-        'no-goggles': 'SEM OCULOS', 'no_goggles': 'SEM OCULOS',
-        'no-vest': 'SEM COLETE', 'no_vest': 'SEM COLETE',
-        'no-glove': 'SEM LUVAS', 'no_glove': 'SEM LUVAS',
-        'no-earplug': 'SEM PROTETOR', 'no_earplug': 'SEM PROTETOR',
-        'no-hairnet': 'SEM TOUCA', 'no_hairnet': 'SEM TOUCA',
+        # --- SEGURO ---
+        'helmet': ('Capacete', 0), 'Helmet': ('Capacete', 0), '1-2-helmet': ('Capacete', 0),
+        '3-4-helmet': ('Capacete', 0), 'Full-face-helmet': ('Capacete', 0),
+        'goggles': ('Oculos', 0),
+        'vest': ('Colete', 0),
+        'glove': ('Luvas', 0),
+        'earplug': ('Protetor', 0),
+        'hairnet': ('Touca', 0),
+        'boots': ('Botas', 0),
         
-        # EPIs
-        'goggles': 'Oculos',
-        'vest': 'Colete',
-        'glove': 'Luvas',
-        'earplug': 'Protetor Auricular',
-        'hairnet': 'Touca',
-        'boots': 'Botas',
-        
-        # Outros
-        'person': 'Pessoa',
-        'cables': 'Fios/Cabos'
+        # --- NEUTRO ---
+        'person': ('Pessoa', 2),
+        'cables': ('Fios/Cabos', 2)
     }
 
-    def __init__(self, model_path="best.pt", conf=0.25):
-        print(f"[INIT] Carregando modelo YOLO local: {model_path}...")
+    LIMITES_CONFIANCA = {
+        'Luvas': 0.15,      
+        'Oculos': 0.10,     
+        'Protetor': 0.15,   
+        'Capacete': 0.30,   
+        'Colete': 0.40,     
+        'SEM OCULOS': 0.60, 
+        'DEFAULT': 0.35     
+    }
+
+    def __init__(self, model_path="best.pt", resolution_ai=416):
+        print(f"[INIT] Inicializando sistema...")
+        self.lock = threading.Lock()
+        self.running = False
+        self.frame_atual = None
+        self.memoria_objetos = [] 
+        self.fps = 0
+        self.resolution_ai = resolution_ai
+
         try:
+            print(f"[INIT] Carregando YOLO ({model_path})...")
             self.model = YOLO(model_path)
-            print("[INIT] Modelo carregado com sucesso!")
+            # Warmup
+            dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
+            self.model(dummy_img, verbose=False)
+            print("[INIT] Sistema pronto!")
         except Exception as e:
-            print(f"[ERRO] Não foi possível carregar o modelo. Verifique se o arquivo existe.\nErro: {e}")
+            print(f"[FATAL] Erro ao carregar modelo: {e}")
             exit()
 
-        self.conf = conf
-        self.running = False
+    def _get_conf_minima(self, nome_bonito):
+        for chave, valor in self.LIMITES_CONFIANCA.items():
+            if chave in nome_bonito:
+                return valor
+        return self.LIMITES_CONFIANCA['DEFAULT']
+
+    def calcular_centro(self, box):
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        return cx, cy
+
+    def atualizar_memoria(self, novas_deteccoes):
+        agora = time.time()
         
-        # Variáveis compartilhadas entre as Threads
-        self.frame_atual = None          # O frame que a câmera acabou de pegar
-        self.deteccoes_atuais = []       # As últimas caixas que a IA achou
-        self.lock = threading.Lock()     # Segurança para as threads não brigarem
+        for novo in novas_deteccoes:
+            novo_cx, novo_cy = self.calcular_centro(novo['box'])
+            match_encontrado = False
 
-    def obter_cor_e_nome(self, nome_raw):
-        """Define a cor e traduz o nome baseado na classe"""
-        nome_raw_limpo = nome_raw.lower().strip()
-        nome_bonito = self.EPI_ALIASES.get(nome_raw, nome_raw) # Tenta traduzir, senão usa o original
+            for antigo in self.memoria_objetos:
+                if antigo['label'] == novo['label']:
+                    antigo_cx, antigo_cy = self.calcular_centro(antigo['box'])
+                    dist = math.hypot(novo_cx - antigo_cx, novo_cy - antigo_cy)
+                    
+                    # Como a imagem será redimensionada para 1920x1080 no final,
+                    # precisamos ser tolerantes com a distância
+                    if dist < self.DISTANCIA_MAX_MATCH:
+                        antigo['box'] = novo['box']
+                        antigo['time'] = agora
+                        match_encontrado = True
+                        break 
+            
+            if not match_encontrado:
+                novo['time'] = agora
+                self.memoria_objetos.append(novo)
 
-        # Lógica de cores
-        if nome_raw_limpo in self.DANGER_CLASSES or "sem" in nome_bonito.lower() or "no_" in nome_raw_limpo:
-            return self.COLOR_RED, nome_bonito
-        elif nome_raw_limpo in self.SAFETY_CLASSES:
-            return self.COLOR_GREEN, nome_bonito
-        else:
-            return self.COLOR_YELLOW, nome_bonito
+        self.memoria_objetos = [
+            obj for obj in self.memoria_objetos 
+            if (agora - obj['time']) < self.TEMPO_MEMORIA
+        ]
 
-    def cerebro_ia(self):
-        """
-        Esta função roda em SEGUNDO PLANO (outra thread).
-        Ela pega o frame atual, passa no YOLO e atualiza as detecções.
-        """
+    def thread_ia(self):
         while self.running:
             if self.frame_atual is not None:
-                # Copia o frame para não travar a câmera
-                img_para_ia = self.frame_atual.copy()
+                try:
+                    # Trabalha com a cópia original (pequena) para ser rápido
+                    img = self.frame_atual.copy()
+                    
+                    results = self.model(img, imgsz=self.resolution_ai, conf=0.05, iou=0.6, verbose=False)
+                    
+                    deteccoes_brutas = []
 
-                # --- INFERÊNCIA YOLO ---
-                # imgsz=320: Mantém rápido para CPU
-                # conf=self.conf: Sua régua de qualidade
-                # iou=0.6: Evita caixas duplicadas
-                results = self.model(img_para_ia, verbose=False, imgsz=320, conf=self.conf, iou=0.6)
+                    for r in results:
+                        for box in r.boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            conf = float(box.conf[0])
+                            cls_id = int(box.cls[0])
+                            nome_raw = self.model.names[cls_id]
 
-                novas_deteccoes = []
-                
-                # Processa os resultados
-                for r in results:
-                    boxes = r.boxes
-                    for box in boxes:
-                        # Extrai dados
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        conf = float(box.conf[0])
-                        cls_id = int(box.cls[0])
-                        nome_raw = self.model.names[cls_id]
+                            info = self.MAPA_CLASSES.get(nome_raw, (nome_raw, 2))
+                            nome_bonito = info[0]
+                            tipo_risco = info[1]
 
-                        # --- FILTROS EXTRAS (OPCIONAL) ---
-                        # Aqui você pode ignorar o "Sem Oculos" se a confiança for baixa
-                        nome_bonito = self.EPI_ALIASES.get(nome_raw, nome_raw)
-                        if "SEM OCULOS" in nome_bonito and conf < 0.50:
-                            continue # Ignora falsos positivos de óculos
+                            limit_min = self._get_conf_minima(nome_bonito)
+                            if conf < limit_min: continue
 
-                        novas_deteccoes.append({
-                            'coords': (x1, y1, x2, y2),
-                            'conf': conf,
-                            'nome_raw': nome_raw
-                        })
+                            if tipo_risco == 1: cor = self.COR_PERIGO
+                            elif tipo_risco == 0: cor = self.COR_SEGURO
+                            else: cor = self.COR_NEUTRO
 
-                # Atualiza a lista oficial de detecções
-                with self.lock:
-                    self.deteccoes_atuais = novas_deteccoes
+                            deteccoes_brutas.append({
+                                'box': (x1, y1, x2, y2),
+                                'label': f"{nome_bonito}", 
+                                'color': cor
+                            })
+
+                    with self.lock:
+                        self.atualizar_memoria(deteccoes_brutas)
+                except Exception as e:
+                    print(f"[ERRO IA] {e}")
+
+            time.sleep(0.015)
+
+    def desenhar_visual(self, frame):
+        if frame is None: return frame
+
+        # --- AQUI ESTÁ A MÁGICA DO TAMANHO ---
+        # Independente do tamanho da sua câmera, vamos forçar virar FULL HD
+        # Isso garante que a janela fique cheia e a imagem também.
+        frame_grande = cv2.resize(frame, (1920, 1080))
+        
+        # Precisamos recalcular a escala das caixas
+        # Se a câmera era 640x480 e virou 1920x1080, as caixas têm que crescer
+        h_orig, w_orig = frame.shape[:2]
+        escala_x = 1920 / w_orig
+        escala_y = 1080 / h_orig
+
+        with self.lock:
+            lista_desenho = list(self.memoria_objetos)
+
+        for item in lista_desenho:
+            # Pega coord original
+            ox1, oy1, ox2, oy2 = item['box']
             
-            # Pequena pausa para não fritar o processador (opcional)
-            time.sleep(0.01)
+            # Aplica a escala para a tela grande
+            x1 = int(ox1 * escala_x)
+            y1 = int(oy1 * escala_y)
+            x2 = int(ox2 * escala_x)
+            y2 = int(oy2 * escala_y)
+            
+            label = item['label']
+            color = item['color']
+            
+            cv2.rectangle(frame_grande, (x1, y1), (x2, y2), color, 3) 
+            
+            # Fonte maior porque a tela é Full HD
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+            cv2.rectangle(frame_grande, (x1, y1 - 40), (x1 + w, y1), color, -1)
+            cv2.putText(frame_grande, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+        cv2.putText(frame_grande, f"FPS: {int(self.fps)}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+        return frame_grande
 
     def iniciar(self):
-        """Inicia a câmera e o loop visual"""
-        cap = cv2.VideoCapture(0)
+        print("[INFO] Tentando abrir câmera (DirectShow)...")
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         
-        # Tenta resolução HD
-        cap.set(3, 1280)
-        cap.set(4, 720)
+        if not cap.isOpened():
+            print("[AVISO] DirectShow falhou. Tentando padrão...")
+            cap = cv2.VideoCapture(0)
 
         if not cap.isOpened():
-            print("[ERRO] Câmera não encontrada.")
+            print("[FATAL] Nenhuma câmera encontrada.")
             return
 
-        self.running = True
+        # Define uma resolução segura para capturar (640x480 é rápido e não trava)
+        # Nós vamos esticar depois, então não precisa ser HD na entrada
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        ret, teste = cap.read()
+        if not ret:
+            print("[ERRO] Imagem da câmera vazia.")
+            return
         
-        # Inicia a Thread da IA (Cérebro separado)
-        thread_ia = threading.Thread(target=self.cerebro_ia)
-        thread_ia.daemon = True
-        thread_ia.start()
+        self.running = True
+        self.frame_atual = teste 
 
-        print("[INFO] Sistema rodando! Pressione 'Q' para sair.")
-        print("[INFO] Thread de vídeo: 30 FPS | Thread de IA: Rodando em paralelo.")
+        t = threading.Thread(target=self.thread_ia)
+        t.daemon = True
+        t.start()
 
-        # Janela maximizada
-        cv2.namedWindow("Detector Profissional Local", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Detector Profissional Local", 1280, 720)
-
+        print("--- SISTEMA ONLINE ---")
+        print("Janela vai abrir em TELA CHEIA.")
+        print("Pressione 'Q' para Sair")
+        
+        nome_janela = "Detector Tela Cheia"
+        cv2.namedWindow(nome_janela, cv2.WINDOW_NORMAL)
+        
+        # --- COMANDO PARA FORÇAR TELA CHEIA (FULLSCREEN) ---
+        cv2.setWindowProperty(nome_janela, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        
+        prev_time = time.time()
         while True:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret: 
+                continue
 
-            # Atualiza o frame para a IA ler
             self.frame_atual = frame
+            
+            # Aqui chamamos o método que desenha e já retorna a imagem em 1920x1080
+            frame_final = self.desenhar_visual(frame)
+            
+            curr_time = time.time()
+            diff = curr_time - prev_time
+            if diff > 0:
+                self.fps = 1 / diff
+            prev_time = curr_time
 
-            # --- DESENHO ---
-            # Pega as últimas detecções disponíveis (com segurança de Thread)
-            with self.lock:
-                deteccoes_para_desenhar = list(self.deteccoes_atuais)
-
-            for det in deteccoes_para_desenhar:
-                x1, y1, x2, y2 = det['coords']
-                conf = det['conf']
-                nome_raw = det['nome_raw']
-
-                cor, texto = self.obter_cor_e_nome(nome_raw)
-                
-                # Desenha Retângulo
-                cv2.rectangle(frame, (x1, y1), (x2, y2), cor, 2)
-                
-                # Desenha Texto com Fundo
-                label = f"{texto} {int(conf*100)}%"
-                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x1, y1 - 25), (x1 + w, y1), cor, -1)
-                cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Informações na tela
-            fps_ia = "IA: Rodando..." 
-            cv2.putText(frame, "Modo: YOLOv11 Local (GPU/CPU)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-
-            cv2.imshow("Detector Profissional Local", frame)
+            cv2.imshow(nome_janela, frame_final)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -199,7 +264,5 @@ class DetectorEPILocal:
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # Inicia o detector usando o best.pt da mesma pasta
-    # conf=0.25: Ajuste a sensibilidade aqui
-    app = DetectorEPILocal(model_path="best.pt", conf=0.25)
+    app = DetectorEPIEstavel(model_path="best.pt", resolution_ai=416)
     app.iniciar()
