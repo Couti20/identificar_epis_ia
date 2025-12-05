@@ -4,10 +4,10 @@ from threading import Thread
 from ultralytics import YOLO
 
 # --- CONFIGURAÇÕES DE ALTA PERFORMANCE ---
-ARQUIVO_MODELO = 'best.pt'
-CONFIDENCE = 0.40           # Aumentei para 40% para evitar falsos positivos, já que a imagem está nítida
-TAMANHO_IMG_YOLO = 640      # 640 é a resolução nativa do treino. Ideal para ver ÓCULOS e detalhes.
-CAMERA_INDEX = 0            # 0 = Notebook, 1 = USB (Troque se necessário)
+ARQUIVO_MODELO = 'principal.pt'
+CONFIDENCE = 0.40           # Limiar de confiança para detecção
+TAMANHO_IMG_YOLO = 640      # Resolução de entrada para o modelo
+CAMERA_INDEX = 0            # 0 = Notebook, 1 = USB
 
 # --- NOMES REAIS ---
 NOMES_CLASSES = {
@@ -18,12 +18,12 @@ NOMES_CLASSES = {
     15: 'Traje Seguranca', 16: 'Colete'
 }
 
-# --- FILTRO ATIVO ---
+# --- FILTRO ATIVO (EPIS e Partes do Corpo) ---
 ITENS_ATIVOS = [
     # Seguros (Verde)
     10, # Capacete
     16, # Colete
-    8,  # Oculos (ATENÇÃO TOTAL AQUI)
+    8,  # Oculos
     9,  # Luvas
     14, # Botas
     
@@ -43,16 +43,9 @@ BRANCO = (255, 255, 255)
 # --- CLASSE DE ACELERAÇÃO (Webcam FULL HD) ---
 class WebcamStream:
     def __init__(self, src=0):
-        # Tenta forçar o driver rápido (DSHOW)
         self.stream = cv2.VideoCapture(src, cv2.CAP_DSHOW)
-        
-        # --- CONFIGURAÇÃO DE ALTA QUALIDADE ---
-        # Tenta abrir em 1920x1080 (Full HD)
-        # Se sua câmera não suportar, ela vai abrir na maior possível automaticamente
         self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        
-        # Buffer pequeno para garantir tempo real (sem delay)
         self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not self.stream.isOpened(): self.stopped = True
@@ -74,6 +67,7 @@ class WebcamStream:
 
 # --- LÓGICA DE SOBREPOSIÇÃO (QUEM ESTÁ USANDO O QUE) ---
 def tem_sobreposicao(box_corpo, box_epi):
+    """Verifica se a caixa do corpo tem sobreposição com a caixa do EPI."""
     c_x1, c_y1, c_x2, c_y2 = map(int, box_corpo.xyxy[0])
     e_x1, e_y1, e_x2, e_y2 = map(int, box_epi.xyxy[0])
 
@@ -91,21 +85,11 @@ def tem_sobreposicao(box_corpo, box_epi):
 def processar_frame(frame, results):
     boxes = results[0].boxes
     
-    # Listas
-    pessoas = []
-    coletes = []
-    capacetes = []
-    cabecas = []
+    # Listas para detecções
+    pessoas, coletes, capacetes, cabecas = [], [], [], []
+    rostos, oculos, maos, luvas = [], [], [], []
+    pes, botas = [], []
     
-    # Listas para Óculos e Luvas
-    rostos = []
-    oculos = []
-    maos = []
-    luvas = []
-    
-    pes = []
-    botas = []
-
     # 1. Separação Inteligente
     for box in boxes:
         cls = int(box.cls[0])
@@ -123,85 +107,127 @@ def processar_frame(frame, results):
         elif cls == 14: botas.append(box)
 
     boxes_finais = [] 
-
-    # --- LÓGICA 1: COLETE ---
-    for pessoa in pessoas:
-        tem_epi = False
-        for epi in coletes:
-            if tem_sobreposicao(pessoa, epi): tem_epi = True; break
-        if not tem_epi: boxes_finais.append({'box': pessoa, 'cor': VERMELHO, 'msg': "SEM COLETE", 'espessura': 2})
-    for x in coletes: boxes_finais.append({'box': x, 'cor': VERDE, 'msg': "OK: COLETE", 'espessura': 2})
-
-    # --- LÓGICA 2: CAPACETE ---
-    for cabeca in cabecas:
-        tem_epi = False
-        for epi in capacetes:
-            if tem_sobreposicao(cabeca, epi): tem_epi = True; break
-        if not tem_epi: boxes_finais.append({'box': cabeca, 'cor': VERMELHO, 'msg': "SEM CAPACETE", 'espessura': 2})
-    for x in capacetes: boxes_finais.append({'box': x, 'cor': VERDE, 'msg': "OK: CAPACETE", 'espessura': 2})
-
-    # --- LÓGICA 3: ÓCULOS (ATENÇÃO ESPECIAL) ---
-    for rosto in rostos:
-        tem_epi = False
-        for epi in oculos:
-            if tem_sobreposicao(rosto, epi): tem_epi = True; break
-        
-        if not tem_epi: 
-            boxes_finais.append({'box': rosto, 'cor': VERMELHO, 'msg': "SEM OCULOS", 'espessura': 2})
     
-    for x in oculos: 
-        # Desenha ÓCULOS com linha mais grossa para destacar
-        boxes_finais.append({'box': x, 'cor': VERDE, 'msg': "OK: OCULOS", 'espessura': 3})
+    # --- NOVO: STATUS GERAL DE EPIs (Para o painel de resumo) ---
+    status_ep_resumo = {
+        'Capacete': {'corpo': cabecas, 'epi': capacetes, 'nome_epi': 'CAPACETE'},
+        'Colete': {'corpo': pessoas, 'epi': coletes, 'nome_epi': 'COLETE'},
+        'Oculos': {'corpo': rostos, 'epi': oculos, 'nome_epi': 'OCULOS'},
+        'Luvas': {'corpo': maos, 'epi': luvas, 'nome_epi': 'LUVA'},
+        'Botas': {'corpo': pes, 'epi': botas, 'nome_epi': 'BOTA'},
+    }
+    
+    # Inicializa o scorecard
+    scorecard = {}
+    
+    # --- LÓGICA DE DETECÇÃO E SOBREPOSIÇÃO (Desenho e Scorecard) ---
+    
+    for item_nome, listas in status_ep_resumo.items():
+        corpo_list = listas['corpo']
+        epi_list = listas['epi']
+        nome_epi = listas['nome_epi']
+        
+        # 1. Verifica se a parte do corpo está coberta
+        for corpo_box in corpo_list:
+            is_covered = False
+            for epi_box in epi_list:
+                if tem_sobreposicao(corpo_box, epi_box):
+                    is_covered = True
+                    break
+            
+            # Se não está coberto, é FALTA (VERMELHO)
+            if not is_covered: 
+                boxes_finais.append({'box': corpo_box, 'cor': VERMELHO, 'msg': f"SEM {nome_epi}", 'espessura': 2})
+            else:
+                # Se está coberto, desenha o EPI como OK (VERDE)
+                # NOTA: Desenhar o EPI diretamente aqui garante que o EPI coberto seja verde
+                # O loop for epi_list abaixo garante que os EPIs não sobrepostos também sejam desenhados (se houver).
+                pass 
+        
+        # 2. Desenha todos os EPIs detectados (Se sobrepostos ou não, ficam VERDES)
+        for epi_box in epi_list:
+            # Óculos é desenhado mais grosso para destaque
+            espessura = 3 if item_nome == 'Oculos' else 2
+            boxes_finais.append({'box': epi_box, 'cor': VERDE, 'msg': f"OK: {nome_epi}", 'espessura': espessura})
 
-    # --- LÓGICA 4: LUVAS ---
-    for mao in maos:
-        tem_epi = False
-        for epi in luvas:
-            if tem_sobreposicao(mao, epi): tem_epi = True; break
-        if not tem_epi: boxes_finais.append({'box': mao, 'cor': VERMELHO, 'msg': "SEM LUVA", 'espessura': 2})
-    for x in luvas: boxes_finais.append({'box': x, 'cor': VERDE, 'msg': "OK: LUVA", 'espessura': 2})
-
-    # --- LÓGICA 5: BOTAS ---
-    for pe in pes:
-        tem_epi = False
-        for epi in botas:
-            if tem_sobreposicao(pe, epi): tem_epi = True; break
-        if not tem_epi: boxes_finais.append({'box': pe, 'cor': VERMELHO, 'msg': "SEM BOTA", 'espessura': 2})
-    for x in botas: boxes_finais.append({'box': x, 'cor': VERDE, 'msg': "OK: BOTA", 'espessura': 2})
-
-    # --- DESENHAR TUDO ---
+        # 3. Atualiza o Scorecard (Verificação Simples: Há partes do corpo sem o EPI?)
+        
+        # Encontra todas as partes do corpo que ESTÃO DESCOBERTAS
+        partes_descobertas = 0
+        for corpo_box in corpo_list:
+            is_covered = False
+            for epi_box in epi_list:
+                if tem_sobreposicao(corpo_box, epi_box):
+                    is_covered = True
+                    break
+            if not is_covered:
+                partes_descobertas += 1
+                
+        # Status final para o painel
+        total_corpo = len(corpo_list)
+        if total_corpo == 0:
+            scorecard[item_nome] = {'status': 'NÃO DETECTADO', 'cor': BRANCO}
+        elif partes_descobertas > 0:
+            scorecard[item_nome] = {'status': 'FALTA', 'cor': VERMELHO}
+        else:
+            scorecard[item_nome] = {'status': 'OK', 'cor': VERDE}
+    
+    # --- DESENHAR CAIXAS E MENSAGENS ---
     for item in boxes_finais:
         box = item['box']
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cv2.rectangle(frame, (x1, y1), (x2, y2), item['cor'], item['espessura'])
         
-        # Fundo do texto mais bonito
-        (w, h), _ = cv2.getTextSize(item['msg'], cv2.FONT_HERSHEY_DUPLEX, 0.6, 1)
-        cv2.rectangle(frame, (x1, y1 - 25), (x1 + w + 10, y1), item['cor'], -1)
+        # Fundo do texto
+        (w_txt, h_txt), _ = cv2.getTextSize(item['msg'], cv2.FONT_HERSHEY_DUPLEX, 0.6, 1)
+        cv2.rectangle(frame, (x1, y1 - 25), (x1 + w_txt + 10, y1), item['cor'], -1)
         
-        # Texto Branco para leitura perfeita
-        cv2.putText(frame, item['msg'], (x1 + 5, y1 - 5), 
-                    cv2.FONT_HERSHEY_DUPLEX, 0.6, BRANCO, 1)
+        # Texto Branco
+        cv2.putText(frame, item['msg'], (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_DUPLEX, 0.6, BRANCO, 1)
 
-    # --- PAINEL INFORMATIVO SUPERIOR ESQUERDO ---
-    # Fundo semi-transparente
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (280, 100), PRETO, -1)
-    alpha = 0.7
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    # --- PAINEL DE STATUS RESUMIDO (Lateral Direita) ---
+    h, w, _ = frame.shape
+    largura_painel = 320
+    
+    # Fundo do Painel Lateral
+    overlay_painel = frame.copy()
+    cv2.rectangle(overlay_painel, (w - largura_painel, 0), (w, h), PRETO, -1)
+    cv2.addWeighted(overlay_painel, 0.7, frame, 1 - 0.7, 0, frame)
 
-    # Informações
+    # Título
+    cv2.putText(frame, "STATUS EPI (Pessoa)", (w - largura_painel + 20, 35), 
+                cv2.FONT_HERSHEY_DUPLEX, 0.8, AMARELO, 1)
+    
+    y_offset = 70
+    
+    # Itera sobre o Scorecard para exibir o resumo
+    for item_nome, status_data in scorecard.items():
+        y_offset += 35
+        status_msg = status_data['status']
+        status_cor = status_data['cor']
+        
+        cv2.putText(frame, f"- {item_nome}:", (w - largura_painel + 20, y_offset), 
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, BRANCO, 1)
+        
+        cv2.putText(frame, status_msg, (w - largura_painel + 170, y_offset), 
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, status_cor, 1)
+        
+    # --- PAINEL INFORMATIVO SUPERIOR ESQUERDO (Total de Pessoas/Óculos) ---
+    
+    overlay_topo = frame.copy()
+    cv2.rectangle(overlay_topo, (0, 0), (280, 100), PRETO, -1)
+    cv2.addWeighted(overlay_topo, 0.7, frame, 1 - 0.7, 0, frame)
+
     qtd_pessoas = len(pessoas)
     qtd_oculos = len(oculos)
     
     cv2.putText(frame, f"PESSOAS: {qtd_pessoas}", (10, 35), cv2.FONT_HERSHEY_DUPLEX, 0.8, AMARELO, 1)
     
-    # Status dos óculos no painel
-    cor_oculos = VERDE if qtd_oculos >= qtd_pessoas and qtd_pessoas > 0 else VERMELHO
+    cor_oculos = VERDE if qtd_pessoas > 0 and scorecard.get('Oculos', {}).get('status') == 'OK' else VERMELHO
     if qtd_pessoas == 0: cor_oculos = BRANCO
     
-    cv2.putText(frame, f"OCULOS DETECTADOS: {qtd_oculos}", (10, 75), cv2.FONT_HERSHEY_DUPLEX, 0.6, cor_oculos, 1)
-
+    cv2.putText(frame, f"OCULOS (Total): {qtd_oculos}", (10, 75), cv2.FONT_HERSHEY_DUPLEX, 0.6, cor_oculos, 1)
+    
     return frame
 
 # --- PROGRAMA PRINCIPAL ---
@@ -213,7 +239,7 @@ webcam = WebcamStream(src=CAMERA_INDEX).start()
 time.sleep(2.0)
 
 if webcam.stopped:
-    print("❌ Erro na câmera.")
+    print("❌ Erro na câmera. Verifique a conexão.")
     exit()
 
 # TELA CHEIA
@@ -228,12 +254,13 @@ while True:
     frame = webcam.read()
     if frame is None: continue
 
-    # MODO LISO: Processa TODO quadro (sem pular) com resolução 640
+    # MODO LISO: Processa TODO quadro com resolução 640
     results = model(frame, imgsz=TAMANHO_IMG_YOLO, conf=CONFIDENCE, verbose=False)
     frame_final = processar_frame(frame.copy(), results)
 
     # FPS
     fps_end = time.time()
+    fps = 0
     if (fps_end - fps_start) > 0: fps = 1 / (fps_end - fps_start)
     fps_start = fps_end
     
