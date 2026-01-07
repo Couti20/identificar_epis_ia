@@ -1,0 +1,40 @@
+# ══════════════════════════════════════════════════════════════
+#  DEPENDÊNCIAS - Sistema de Detecção de EPIs
+# ══════════════════════════════════════════════════════════════
+#
+#  ╔═══════════════════════════════════════════════════════════╗
+#  ║  COMANDOS PARA INSTALAR (COPIE E COLE NO TERMINAL):      ║
+#  ╠═══════════════════════════════════════════════════════════╣
+#  ║                                                           ║
+#  ║  WINDOWS (CMD ou PowerShell):                            ║
+#  ║  ─────────────────────────────                           ║
+#  ║  python -m venv venv                                     ║
+#  ║  venv\Scripts\activate                                   ║
+#  ║  pip install opencv-python ultralytics numpy             ║
+#  ║                                                           ║
+#  ║  LINUX/MAC (Terminal):                                   ║
+#  ║  ─────────────────────                                   ║
+#  ║  python3 -m venv venv                                    ║
+#  ║  source venv/bin/activate                                ║
+#  ║  pip install opencv-python ultralytics numpy             ║
+#  ║                                                           ║
+#  ║  OU SIMPLESMENTE EXECUTE:                                ║
+#  ║  ────────────────────────                                ║
+#  ║  Windows: instalar.bat                                   ║
+#  ║  Linux:   bash instalar.sh                               ║
+#  ║                                                           ║
+#  ╚═══════════════════════════════════════════════════════════╝
+#
+# ══════════════════════════════════════════════════════════════
+
+# Visão Computacional
+opencv-python>=4.8.0
+
+# Modelo YOLO (Ultralytics)
+ultralytics>=8.0.0
+
+# Computação Numérica (instalado automaticamente com ultralytics)
+numpy>=1.24.0
+
+# Torch (instalado automaticamente com ultralytics)
+# torch>=2.0.0
