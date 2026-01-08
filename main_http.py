@@ -40,7 +40,34 @@ from ultralytics import YOLO
 # │  - USB externa:      1                                                      │
 # └─────────────────────────────────────────────────────────────────────────────┘
 
-CAMERA_URL = "http://192.168.1.100:8080/video"  # ← ALTERE AQUI!
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  ESCOLHA O TIPO DE CÂMERA E CONFIGURE ABAIXO:                             ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+# OPÇÃO 1: DroidCam / IP Webcam (celular)
+CAMERA_IP = "192.168.137.11"
+CAMERA_PORTA = 4747
+
+# OPÇÃO 2: Câmera de Segurança (RTSP) - descomente e configure se usar
+# CAMERA_URL_RTSP = "rtsp://admin:senha@192.168.1.100:554/stream1"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NÃO ALTERE ABAIXO (configuração automática)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Verifica se tem RTSP configurado
+try:
+    CAMERA_URL_RTSP
+    CAMERA_URLS = [CAMERA_URL_RTSP]  # Usa RTSP direto
+except NameError:
+    # Usa HTTP (DroidCam/IP Webcam)
+    CAMERA_URLS = [
+        f"http://{CAMERA_IP}:{CAMERA_PORTA}/video",
+        f"http://{CAMERA_IP}:{CAMERA_PORTA}/mjpegfeed",
+        f"http://{CAMERA_IP}:{CAMERA_PORTA}/videofeed",
+        f"http://{CAMERA_IP}:{CAMERA_PORTA}",
+    ]
+CAMERA_URL = None  # Será definido automaticamente
 
 # Outras configurações
 MODELO_PATH = 'oitenta-tres.pt'
@@ -188,7 +215,27 @@ def processar_frame(frame, results):
 #                            PROGRAMA PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
+def conectar_camera():
+    """Tenta conectar usando todas as URLs possíveis."""
+    print(f"\n[2/3] Conectando câmera...")
+    
+    for url in CAMERA_URLS:
+        print(f"      Testando: {url}")
+        cap = cv2.VideoCapture(url)
+        time.sleep(1)  # Aguarda conexão
+        
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print(f"      ✓ Conectado via: {url}")
+                return cap, url
+            cap.release()
+    
+    return None, None
+
+
 def main():
+    global CAMERA_URL
     print("=" * 60)
     print("   SISTEMA DE DETECÇÃO DE EPIs - CÂMERA HTTP")
     print("=" * 60)
@@ -202,26 +249,15 @@ def main():
         print(f"      ✗ Erro: {e}")
         return
     
-    # Conecta câmera
-    print(f"\n[2/3] Conectando câmera HTTP...")
-    print(f"      URL: {CAMERA_URL}")
+    # Conecta câmera (tenta todas as URLs)
+    cap, CAMERA_URL = conectar_camera()
     
-    cap = cv2.VideoCapture(CAMERA_URL)
-    
-    # Aguarda conexão
-    tentativas = 0
-    while not cap.isOpened() and tentativas < 10:
-        print(f"      Tentativa {tentativas + 1}/10...")
-        time.sleep(1)
-        cap = cv2.VideoCapture(CAMERA_URL)
-        tentativas += 1
-    
-    if not cap.isOpened():
+    if cap is None:
         print("      ✗ Erro: Não foi possível conectar à câmera!")
         print("\n      Verifique:")
-        print("      - O celular está na mesma rede Wi-Fi?")
-        print("      - O app da câmera está aberto?")
-        print("      - O endereço está correto?")
+        print("      - A câmera está ligada e na mesma rede?")
+        print("      - O IP e porta estão corretos?")
+        print("      - Para RTSP: usuário e senha estão corretos?")
         return
     
     print("      ✓ Câmera conectada!")
