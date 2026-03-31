@@ -30,7 +30,7 @@ class Config:
     TAMANHO_INFERENCIA = 640      # Resolução de entrada do YOLO
     
     # Câmera
-    CAMERA_INDEX = 0              # 0 = Webcam integrada, 1 = USB externa
+    CAMERA_INDEX = 1            # 0 = Webcam integrada, 1 = USB externa
     CAMERA_LARGURA = 1920
     CAMERA_ALTURA = 1080
     
