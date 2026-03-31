@@ -44,6 +44,10 @@ from ultralytics import YOLO
 # ║  ESCOLHA O TIPO DE CÂMERA E CONFIGURE ABAIXO:                             ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
+# rtsp://admin:minhasenha123@192.168.1.50:554/stream1
+ #      └─┬─┘ └─────┬─────┘ └────┬─────┘ └┬┘ └──┬──┘
+      # usuário    senha         IP      porta caminho
+
 # OPÇÃO 1: DroidCam / IP Webcam (celular)
 CAMERA_IP = "192.168.137.11"
 CAMERA_PORTA = 4747
